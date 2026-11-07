@@ -1,0 +1,190 @@
+name: Kantong CI/CD & Production Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish as a public GitHub Release?'
+        required: true
+        type: boolean
+        default: true
+      version_tag:
+        description: 'Release version tag (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ====================================================================
+  # PHASE 1: Quality Control, Linting & Automated Testing
+  # ====================================================================
+  quality-control:
+    name: Quality Control & Test Suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Verify Gradle Dependencies Configuration
+        run: ./gradlew :app:dependencies --configuration debugRuntimeClasspath
+
+      - name: Run Unit & Integration Tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Run Android Lint (Debug)
+        run: ./gradlew :app:lintDebug --stacktrace
+
+      - name: Upload Test Results on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results*.html
+          retention-days: 7
+
+  # ====================================================================
+  # PHASE 2: Build & Package Production Artifacts
+  # ====================================================================
+  build-package:
+    name: Build Android Package
+    needs: quality-control
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      apk_path: ${{ steps.package_assets.outputs.apk_path }}
+      sha_path: ${{ steps.package_assets.outputs.sha_path }}
+      version: ${{ steps.package_assets.outputs.version }}
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Assemble Android APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Package & Generate Checksums
+        id: package_assets
+        run: |
+          mkdir -p artifacts
+          APK_SRC=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          if [ -z "$APK_SRC" ]; then
+            echo "::error::No APK file generated during build!"
+            exit 1
+          fi
+
+          VERSION="v1.0.0"
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.version_tag }}" ]; then
+            VERSION="${{ inputs.version_tag }}"
+          fi
+
+          APK_NAME="Kantong-${VERSION}.apk"
+          cp "$APK_SRC" "artifacts/${APK_NAME}"
+
+          cd artifacts
+          sha256sum "${APK_NAME}" > "${APK_NAME}.sha256"
+          echo "Generated Checksum:"
+          cat "${APK_NAME}.sha256"
+          cd ..
+
+          echo "apk_path=artifacts/${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "sha_path=artifacts/${APK_NAME}.sha256" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Upload APK Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kantong-Android-Package
+          path: |
+            artifacts/*.apk
+            artifacts/*.sha256
+          retention-days: 30
+
+  # ====================================================================
+  # PHASE 3: Production Release Publishing
+  # ====================================================================
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-package
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Download Built Package Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Kantong-Android-Package
+          path: release-assets
+
+      - name: Verify Release Assets
+        run: |
+          ls -lh release-assets/
+          if [ ! -f release-assets/Kantong-${{ needs.build-package.outputs.version }}.apk ]; then
+            echo "::error::Release APK asset missing!"
+            exit 1
+          fi
+
+      - name: Publish Official GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-package.outputs.version }}
+          name: Kantong ${{ needs.build-package.outputs.version }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: |
+            release-assets/*.apk
+            release-assets/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

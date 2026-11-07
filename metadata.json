@@ -1,0 +1,6 @@
+{
+  "name": "Kantong",
+  "description": "Catatan keuangan pribadi yang ringan, cepat, dan intuitif dengan target tabungan toples, anggaran bulanan, dan nuansa pantai.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
